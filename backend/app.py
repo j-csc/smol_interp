@@ -1,5 +1,8 @@
 import modal
 
+import pandas as pd
+import requests
+
 MODEL_NAME = "google/gemma-2-2b-it"
 SAE_RELEASE = "gemma-scope-2b-pt-res-canonical"
 SAE_ID = "layer_0/width_16k/canonical"
@@ -10,6 +13,8 @@ image = modal.Image.debian_slim().pip_install("transformer-lens", "sae-lens")
 
 volume = modal.Volume.from_name("model-cache", create_if_missing=True)
 
+# TODO: Try feature finding with ablation and attribution patching and DLA
+
 @app.cls(
     gpu="T4",
     image=image,
@@ -17,7 +22,7 @@ volume = modal.Volume.from_name("model-cache", create_if_missing=True)
     volumes={"/cache": volume},
     scaledown_window=300,
 )
-class Model:
+class Interp:
     @modal.enter()
     def load(self):
         import torch
@@ -46,12 +51,36 @@ class Model:
         return {
             "logits": logits.squeeze(0).tolist()
         }
-
-    @modal.method()
-    def test_sae(self, prompt: str):
-        print(self.sae.cfg)
-        pass
     
+    def get_auto_interp_neuronpedia(self, sae_release=SAE_RELEASE, sae_id=SAE_ID) -> pd.DataFrame:
+        from sae_lens.loading.pretrained_saes_directory import get_pretrained_saes_directory
+        release = get_pretrained_saes_directory()[sae_release]
+        neuronpedia_id = release.neuronpedia_id[sae_id]
+
+        url = "https://www.neuronpedia.org/api/explanation/export?modelId={}&saeId={}".format(
+            *neuronpedia_id.split("/")
+        )
+        headers = {"Content-Type": "application/json"}
+        response = requests.get(url, headers=headers)
+        return pd.DataFrame(response.json())
+    
+    def print_activated_features(self, prompt:str):
+        import torch
+        from sae_lens import SAE
+        
+        assert self.sae is not None and isinstance(self.sae, SAE), "SAE not loaded yet. Call load() first."
+        
+        logits, cache = self.model.run_with_cache_with_saes(prompt, saes=[self.sae])
+
+        assert logits is not None and isinstance(logits, torch.Tensor), "Logits should be a tensor"
+        
+        top_logit_token_id = logits[0, -1].argmax(-1)
+        top_logit_token_text = self.model.to_string(top_logit_token_id)
+        print(f"Top predicted token from standard model logits: {top_logit_token_text!r}")
+
+        cachename = f"{self.sae.cfg.metadata.hook_name}.hook_sae_acts_post"
+        sae_acts_post = cache[cachename][0, -1, :]
+        print([(act, idx) for act, idx in zip(*sae_acts_post.topk(5))])
 
     @modal.method()
     def get_model_info(self):
@@ -64,12 +93,12 @@ class Model:
 
 @app.local_entrypoint()
 def main():
-    model = Model()
+    model = Interp()
 
     info = model.get_model_info.remote()
     print(f"Model info: {info}")
 
-    prompt = "The Eiffel Tower is in"
-    print(f"\nRunning inference on: '{prompt}'")
-
-    model.test_sae.remote(prompt)
+if __name__ == "__main__":
+    print("hi")
+    model = Interp()
+    print(model.get_auto_interp_neuronpedia().head)

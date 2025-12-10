@@ -9,4 +9,5 @@ dependencies = [
     "transformer-lens>=2.0.0",
     "fastapi>=0.115.0",
     "sae-lens>=4.0.0",
+    "pandas>=2.3.3",
 ]
