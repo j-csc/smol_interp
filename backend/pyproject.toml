@@ -11,3 +11,9 @@ dependencies = [
     "sae-lens>=4.0.0",
     "pandas>=2.3.3",
 ]
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.36.1",
+    "ruff>=0.14.9",
+]
