@@ -17,7 +17,7 @@ class SteeringConfig(NamedTuple):
     steering_strength: float
 
 
-app = modal.App("smol-interp")
+app = modal.App("autosteer")
 
 image = modal.Image.debian_slim().pip_install(
     "fastapi[standard]",

@@ -1,7 +1,7 @@
 [project]
-name = "backend"
+name = "autosteer-backend"
 version = "0.1.0"
-description = "smol mech interp backend"
+description = "Autosteer"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

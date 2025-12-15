@@ -172,21 +172,7 @@ wheels = [
 ]
 
 [[package]]
-name = "babe"
-version = "0.0.7"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "graze" },
-    { name = "pandas" },
-    { name = "py2store" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/1b/f1/7b5c9e20222fa33a29d471b710f6641582e1a0d16a2ca16e44914511b640/babe-0.0.7.tar.gz", hash = "sha256:746bf5184236d682de6f0a2b9b26d5dfc1d44a031eb12f30b6fc2451976b0ded", size = 8785, upload_time = "2020-11-11T01:36:41.933Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/85/44/a4f6454ad1a91de0757232c182d1ac0314f6b41827b25ed461dc02c84bb5/babe-0.0.7-py3-none-any.whl", hash = "sha256:660b6f1647012e517e1cfdfe362d52949a451fd8ba220d620513f912a04e2c77", size = 6871, upload_time = "2020-11-11T01:36:40.505Z" },
-]
-
-[[package]]
-name = "backend"
+name = "autosteer-backend"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
@@ -216,6 +202,20 @@ requires-dist = [
 dev = [
     { name = "basedpyright", specifier = ">=1.36.1" },
     { name = "ruff", specifier = ">=0.14.9" },
+]
+
+[[package]]
+name = "babe"
+version = "0.0.7"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "graze" },
+    { name = "pandas" },
+    { name = "py2store" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/1b/f1/7b5c9e20222fa33a29d471b710f6641582e1a0d16a2ca16e44914511b640/babe-0.0.7.tar.gz", hash = "sha256:746bf5184236d682de6f0a2b9b26d5dfc1d44a031eb12f30b6fc2451976b0ded", size = 8785, upload_time = "2020-11-11T01:36:41.933Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/85/44/a4f6454ad1a91de0757232c182d1ac0314f6b41827b25ed461dc02c84bb5/babe-0.0.7-py3-none-any.whl", hash = "sha256:660b6f1647012e517e1cfdfe362d52949a451fd8ba220d620513f912a04e2c77", size = 6871, upload_time = "2020-11-11T01:36:40.505Z" },
 ]
 
 [[package]]
