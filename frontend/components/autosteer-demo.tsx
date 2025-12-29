@@ -907,7 +907,7 @@ export function AutoSteerDemo() {
             <div className="text-center">
               <p className="text-[14px] text-muted-foreground/70">No analysis selected</p>
               <p className="mt-1 text-[12px] text-muted-foreground/50">
-                Generate a response and click "View analysis"
+                Generate a response and click &quot;View analysis&quot;
               </p>
             </div>
           </div>
