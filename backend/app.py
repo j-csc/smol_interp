@@ -26,6 +26,7 @@ image = modal.Image.debian_slim().pip_install(
     "sae-lens",
     "pandas",
     "requests",
+    "openai",
 )
 
 volume = modal.Volume.from_name("model-cache", create_if_missing=True)
@@ -34,7 +35,10 @@ volume = modal.Volume.from_name("model-cache", create_if_missing=True)
 @app.cls(
     gpu="T4",
     image=image,
-    secrets=[modal.Secret.from_name("huggingface-secret")],
+    secrets=[
+        modal.Secret.from_name("huggingface-secret"),
+        modal.Secret.from_name("openai-secret"),
+    ],
     volumes={"/cache": volume},
     scaledown_window=300,
 )
@@ -45,6 +49,9 @@ class ModalInterp:
     sparsity: Any = None
     explanations_df: Any = None
     explanations_by_index: Any = None
+    openai_client: Any = None
+    feature_embeddings: Any = None
+    feature_indices: Any = None
 
     @modal.enter()
     def load(self) -> None:
@@ -96,6 +103,60 @@ class ModalInterp:
             )
         else:
             self.explanations_by_index = {}
+
+        from openai import OpenAI
+
+        self.openai_client = OpenAI()
+
+        embeddings_path = "/cache/openai_embeddings.pkl"
+        if os.path.exists(embeddings_path):
+            with open(embeddings_path, "rb") as f:
+                cache_data = pickle.load(f)
+                self.feature_embeddings = cache_data["embeddings"]
+                self.feature_indices = cache_data["indices"]
+        else:
+            valid_features = [
+                (idx, desc)
+                for idx, desc in self.explanations_by_index.items()
+                if desc and isinstance(desc, str) and len(desc.strip()) > 0
+            ]
+
+            if valid_features:
+                self.feature_indices = [idx for idx, _ in valid_features]
+                descriptions = [desc for _, desc in valid_features]
+
+                print(f"Computing embeddings for {len(descriptions)} features...")
+                embeddings = []
+                batch_size = 2048
+
+                for i in range(0, len(descriptions), batch_size):
+                    batch = descriptions[i : i + batch_size]
+                    response = self.openai_client.embeddings.create(
+                        model="text-embedding-ada-002", input=batch
+                    )
+                    batch_embeddings = [item.embedding for item in response.data]
+                    embeddings.extend(batch_embeddings)
+                    print(
+                        f"  Processed {min(i + batch_size, len(descriptions))}/{len(descriptions)}"
+                    )
+
+                import numpy as np
+
+                self.feature_embeddings = np.array(embeddings, dtype=np.float32)
+
+                with open(embeddings_path, "wb") as f:
+                    pickle.dump(
+                        {
+                            "embeddings": self.feature_embeddings,
+                            "indices": self.feature_indices,
+                        },
+                        f,
+                    )
+                volume.commit()
+                print("Embeddings cached successfully")
+            else:
+                self.feature_indices = []
+                self.feature_embeddings = None
 
     def _fetch_neuronpedia_explanations(
         self, sae_release: str = SAE_RELEASE, sae_id: str = SAE_ID
@@ -245,11 +306,135 @@ class ModalInterp:
         feature_acts: Tensor,
         target_token_id: int | None = None,
         top_k: int = 5,
-    ):
+    ) -> list[tuple[float, int]] | Tensor:
         W_dec = self.sae.W_dec.to(token_residual.device, token_residual.dtype)
         W_U = self.model.W_U.to(token_residual.device, token_residual.dtype)
 
-        pass
+        feature_to_logits = W_dec @ W_U
+
+        if target_token_id is not None:
+            contributions = feature_acts * feature_to_logits[:, target_token_id]
+            top_vals, top_idx = contributions.topk(top_k)
+            return [(float(v.item()), int(i.item())) for v, i in zip(top_vals, top_idx)]
+
+        logit_contributions = feature_acts @ feature_to_logits
+        return logit_contributions
+
+    def _find_max_activating_examples(
+        self,
+        feature_idx: int,
+        texts: list[str],
+        n_examples: int = 5,
+    ) -> list[dict[str, Any]]:
+        from sae_lens import SAE
+
+        assert self.sae is not None and isinstance(self.sae, SAE)
+
+        examples = []
+        for text in texts:
+            _, cache = self.model.run_with_cache_with_saes(text, saes=[self.sae])
+            cachename = f"{self.sae.cfg.metadata.hook_name}.hook_sae_acts_post"
+            sae_acts_post: Tensor = cache[cachename][0]
+
+            tokens = self.model.to_str_tokens(text)
+            if not isinstance(tokens, list):
+                tokens = [str(tokens)]
+
+            for pos in range(sae_acts_post.shape[0]):
+                activation = float(sae_acts_post[pos, feature_idx].item())
+                if activation > 0:
+                    examples.append(
+                        {
+                            "text": text,
+                            "token": tokens[pos] if pos < len(tokens) else "",
+                            "position": pos,
+                            "activation": activation,
+                        }
+                    )
+
+        examples.sort(key=lambda x: x["activation"], reverse=True)
+        return examples[:n_examples]
+
+    def _search_features_by_description(
+        self, query: str, top_k: int = 5
+    ) -> list[tuple[int, float, str]]:
+        import numpy as np
+
+        if self.feature_embeddings is None or len(self.feature_indices) == 0:
+            return []
+
+        query_response = self.openai_client.embeddings.create(
+            model="text-embedding-ada-002", input=[query]
+        )
+        query_embedding = np.array(query_response.data[0].embedding, dtype=np.float32)
+
+        similarities = np.dot(self.feature_embeddings, query_embedding) / (
+            np.linalg.norm(self.feature_embeddings, axis=1)
+            * np.linalg.norm(query_embedding)
+        )
+
+        top_indices = np.argsort(similarities)[-top_k:][::-1]
+
+        results = []
+        for idx in top_indices:
+            feature_idx = self.feature_indices[idx]
+            similarity = float(similarities[idx])
+            description = self.explanations_by_index.get(feature_idx, "")
+            results.append((feature_idx, similarity, description))
+
+        return results
+
+    def auto_interpret_feature(
+        self,
+        feature_idx: int,
+        example_texts: list[str],
+        n_examples: int = 5,
+    ) -> dict[str, Any]:
+        max_activating = self._find_max_activating_examples(
+            feature_idx, example_texts, n_examples
+        )
+
+        if not max_activating:
+            return {
+                "feature_idx": feature_idx,
+                "explanation": "No activations found",
+                "examples": [],
+            }
+
+        prompt_parts = [
+            "Below are examples of text tokens where a particular neural network feature activated strongly.",
+            "Each example shows the token and its activation strength.",
+            "Based on these examples, provide a concise 1-2 sentence explanation of what semantic pattern this feature detects.\n",
+        ]
+
+        for i, ex in enumerate(max_activating, 1):
+            prompt_parts.append(
+                f"{i}. Token: '{ex['token']}' (activation: {ex['activation']:.2f})"
+            )
+            prompt_parts.append(f"   Context: {ex['text']}\n")
+
+        prompt_parts.append(
+            "\nWhat pattern does this feature detect? Be specific and concise."
+        )
+        interpretation_prompt = "\n".join(prompt_parts)
+
+        input_ids = self.model.to_tokens(interpretation_prompt)
+        output = self.model.generate(
+            input_ids,
+            max_new_tokens=100,
+            temperature=0.3,
+            top_p=0.9,
+            stop_at_eos=True,
+        )
+
+        explanation = self.model.tokenizer.decode(output[0], skip_special_tokens=True)
+        explanation = explanation[len(interpretation_prompt) :].strip()
+
+        return {
+            "feature_idx": feature_idx,
+            "explanation": explanation,
+            "examples": max_activating,
+        }
 
     def generate_with_explanations(
         self, prompt: str, max_new_tokens: int = 20, top_k: int = 5
@@ -344,6 +529,336 @@ class ModalInterp:
 
         return self.model.tokenizer.decode(output[0], skip_special_tokens=True)
 
+    def auto_steer(
+        self,
+        prompt: str,
+        desired_attributes: list[str],
+        max_new_tokens: int = 100,
+        top_k_features: int = 3,
+    ) -> dict[str, Any]:
+        baseline_result = self.generate_with_explanations(
+            prompt, max_new_tokens=0, top_k=10
+        )
+        baseline_activations = baseline_result["feature_max_activations"]
+
+        all_features = []
+        for attribute in desired_attributes:
+            found_features = self._search_features_by_description(
+                attribute, top_k=top_k_features
+            )
+            for feature_idx, relevance_score, reasoning in found_features:
+                baseline_act = baseline_activations.get(feature_idx, 10.0)
+                all_features.append(
+                    {
+                        "attribute": attribute,
+                        "feature_idx": feature_idx,
+                        "relevance_score": relevance_score,
+                        "reasoning": reasoning,
+                        "baseline_activation": baseline_act,
+                    }
+                )
+
+        import json
+
+        optimization_prompt = f"""You are an AI assistant optimizing neural network steering for text generation.
+
+Task: Generate text with these attributes: {", ".join(desired_attributes)}
+Prompt: "{prompt}"
+
+Available features to steer:
+{json.dumps(all_features, indent=2)}
+
+For each feature, determine the optimal steering strength (typically 0.5 to 3.0). Consider:
+- Relevance score (how well it matches the desired attribute)
+- Baseline activation (higher baseline = feature already present, may need less boost)
+- Potential interactions between features
+- Risk of over-steering (too high can make text unnatural)
+
+Respond with a JSON object:
+{{
+  "steering_configs": [
+    {{"feature_idx": <int>, "steering_strength": <float>, "reasoning": "<brief explanation>"}},
+    ...
+  ],
+  "overall_strategy": "<brief explanation of the steering approach>"
+}}"""
+
+        response = self.openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": optimization_prompt}],
+            temperature=0.3,
+            response_format={"type": "json_object"},
+        )
+
+        optimization_result = json.loads(response.choices[0].message.content)
+
+        steering_configs = []
+        optimized_features = []
+
+        for config in optimization_result.get("steering_configs", []):
+            feature_idx = config["feature_idx"]
+            strength = config["steering_strength"]
+
+            feature_info = next(
+                (f for f in all_features if f["feature_idx"] == feature_idx), None
+            )
+            if not feature_info:
+                continue
+
+            max_act = feature_info["baseline_activation"]
+
+            steering_configs.append(
+                SteeringConfig(
+                    steering_feature=feature_idx,
+                    max_act=max_act,
+                    steering_strength=strength,
+                )
+            )
+
+            optimized_features.append(
+                {
+                    "feature_idx": feature_idx,
+                    "max_act": max_act,
+                    "steering_strength": strength,
+                    "reasoning": config.get("reasoning", ""),
+                    "attribute": feature_info["attribute"],
+                    "feature_description": self.explanations_by_index.get(
+                        feature_idx, ""
+                    ),
+                }
+            )
+
+        steered_text = self.run_with_steering(
+            prompt, steering_configs, max_new_tokens=max_new_tokens
+        )
+
+        return {
+            "prompt": prompt,
+            "baseline_text": baseline_result["full_text"],
+            "steered_text": steered_text,
+            "desired_attributes": desired_attributes,
+            "optimized_features": optimized_features,
+            "overall_strategy": optimization_result.get("overall_strategy", ""),
+        }
+
+    def auto_steer_from_prompt(
+        self,
+        prompt: str,
+        steering_prompt: str,
+        max_new_tokens: int = 100,
+        top_k_features: int = 3,
+    ) -> dict[str, Any]:
+        """Auto-steer based on a natural language steering prompt.
+
+        Args:
+            prompt: The text generation prompt
+            steering_prompt: Natural language description of how to steer (e.g., "Make it dark and mysterious")
+            max_new_tokens: Maximum tokens to generate
+            top_k_features: Number of features to find per attribute
+
+        Returns:
+            Dict containing steered text, baseline, and full transparency about what was steered
+        """
+        import json
+
+        attribute_extraction_prompt = f"""You are analyzing a user's request to steer text generation.
+
+Generation prompt: "{prompt}"
+Steering request: "{steering_prompt}"
+
+Extract 2-5 specific attributes or concepts that should be amplified in the generation to satisfy the steering request.
+Be specific and concrete. Focus on semantic concepts, tones, styles, or themes.
+
+Examples:
+- "Make it scary" → ["fear/dread emotions", "ominous imagery", "suspenseful pacing"]
+- "More technical and formal" → ["technical terminology", "formal language", "precise descriptions"]
+- "Add humor" → ["playful tone", "comedic situations", "wit/wordplay"]
+
+Respond with a JSON object:
+{{
+  "attributes": ["<attribute1>", "<attribute2>", ...],
+  "reasoning": "<brief explanation of why these attributes match the steering request>"
+}}"""
+
+        response = self.openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": attribute_extraction_prompt}],
+            temperature=0.3,
+            response_format={"type": "json_object"},
+        )
+
+        extraction_result = json.loads(response.choices[0].message.content)
+        desired_attributes = extraction_result.get("attributes", [])
+        attribute_reasoning = extraction_result.get("reasoning", "")
+
+        baseline_result = self.generate_with_explanations(
+            prompt, max_new_tokens=0, top_k=10
+        )
+        baseline_activations = baseline_result["feature_max_activations"]
+
+        all_features = []
+        for attribute in desired_attributes:
+            found_features = self._search_features_by_description(
+                attribute, top_k=top_k_features
+            )
+            for feature_idx, relevance_score, reasoning in found_features:
+                baseline_act = baseline_activations.get(feature_idx, 10.0)
+                all_features.append(
+                    {
+                        "attribute": attribute,
+                        "feature_idx": feature_idx,
+                        "relevance_score": relevance_score,
+                        "reasoning": reasoning,
+                        "baseline_activation": baseline_act,
+                    }
+                )
+
+        optimization_prompt = f"""You are an AI assistant optimizing neural network steering for text generation.
+
+Generation prompt: "{prompt}"
+User's steering request: "{steering_prompt}"
+Extracted attributes: {", ".join(desired_attributes)}
+
+Available features to steer:
+{json.dumps(all_features, indent=2)}
+
+For each feature, determine the optimal steering strength (typically 0.5 to 3.0). Consider:
+- Relevance score (how well it matches the desired attribute)
+- Baseline activation (higher baseline = feature already present, may need less boost)
+- Potential interactions between features
+- Risk of over-steering (too high can make text unnatural)
+
+Respond with a JSON object:
+{{
+  "steering_configs": [
+    {{"feature_idx": <int>, "steering_strength": <float>, "reasoning": "<brief explanation>"}},
+    ...
+  ],
+  "overall_strategy": "<brief explanation of the steering approach>"
+}}"""
+
+        response = self.openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": optimization_prompt}],
+            temperature=0.3,
+            response_format={"type": "json_object"},
+        )
+
+        optimization_result = json.loads(response.choices[0].message.content)
+
+        steering_configs = []
+        optimized_features = []
+
+        for config in optimization_result.get("steering_configs", []):
+            feature_idx = config["feature_idx"]
+            strength = config["steering_strength"]
+
+            feature_info = next(
+                (f for f in all_features if f["feature_idx"] == feature_idx), None
+            )
+            if not feature_info:
+                continue
+
+            max_act = feature_info["baseline_activation"]
+
+            steering_configs.append(
+                SteeringConfig(
+                    steering_feature=feature_idx,
+                    max_act=max_act,
+                    steering_strength=strength,
+                )
+            )
+
+            optimized_features.append(
+                {
+                    "feature_idx": feature_idx,
+                    "max_act": max_act,
+                    "steering_strength": strength,
+                    "reasoning": config.get("reasoning", ""),
+                    "attribute": feature_info["attribute"],
+                    "feature_description": self.explanations_by_index.get(
+                        feature_idx, ""
+                    ),
+                }
+            )
+
+        steered_text = self.run_with_steering(
+            prompt, steering_configs, max_new_tokens=max_new_tokens
+        )
+
+        return {
+            "prompt": prompt,
+            "steering_prompt": steering_prompt,
+            "baseline_text": baseline_result["full_text"],
+            "steered_text": steered_text,
+            "extracted_attributes": desired_attributes,
+            "attribute_reasoning": attribute_reasoning,
+            "optimized_features": optimized_features,
+            "overall_strategy": optimization_result.get("overall_strategy", ""),
+        }
+
+    def preview_steering(
+        self,
+        prompt: str,
+        steering_prompt: str,
+        top_k_features: int = 3,
+    ) -> dict[str, Any]:
+        """Preview which features would be steered without generating text."""
+        import json
+
+        attribute_extraction_prompt = f"""You are analyzing a user's request to steer text generation.
+
+Generation prompt: "{prompt}"
+Steering request: "{steering_prompt}"
+
+Extract 2-5 specific attributes or concepts that should be amplified in the generation to satisfy the steering request.
+Be specific and concrete. Focus on semantic concepts, tones, styles, or themes.
+
+Examples:
+- "Make it scary" → ["fear/dread emotions", "ominous imagery", "suspenseful pacing"]
+- "More technical and formal" → ["technical terminology", "formal language", "precise descriptions"]
+- "Add humor" → ["playful tone", "comedic situations", "wit/wordplay"]
+
+Respond with a JSON object:
+{{
+  "attributes": ["<attribute1>", "<attribute2>", ...],
+  "reasoning": "<brief explanation of why these attributes match the steering request>"
+}}"""
+
+        response = self.openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": attribute_extraction_prompt}],
+            temperature=0.3,
+            response_format={"type": "json_object"},
+        )
+
+        extraction_result = json.loads(response.choices[0].message.content)
+        desired_attributes = extraction_result.get("attributes", [])
+        attribute_reasoning = extraction_result.get("reasoning", "")
+
+        all_features = []
+        for attribute in desired_attributes:
+            found_features = self._search_features_by_description(
+                attribute, top_k=top_k_features
+            )
+            for feature_idx, relevance_score, description in found_features:
+                all_features.append(
+                    {
+                        "attribute": attribute,
+                        "feature_idx": feature_idx,
+                        "relevance_score": relevance_score,
+                        "feature_description": description,
+                    }
+                )
+
+        return {
+            "prompt": prompt,
+            "steering_prompt": steering_prompt,
+            "extracted_attributes": desired_attributes,
+            "attribute_reasoning": attribute_reasoning,
+            "candidate_features": all_features,
+        }
+
     def get_model_info(self) -> dict[str, Any]:
         return {
             "model_name": MODEL_NAME,
@@ -355,6 +870,33 @@ class ModalInterp:
         if isinstance(self.explanations_df, pd.DataFrame):
             return self.explanations_df.to_dict(orient="records")
         return []
+
+    def get_random_features(self, count: int = 25) -> list[dict[str, Any]]:
+        """Get random features with their descriptions for browsing."""
+        import random
+
+        if not self.explanations_by_index:
+            return []
+
+        valid_features = [
+            (idx, desc)
+            for idx, desc in self.explanations_by_index.items()
+            if desc and isinstance(desc, str) and len(desc.strip()) > 10
+        ]
+
+        if not valid_features:
+            return []
+
+        sample_size = min(count, len(valid_features))
+        sampled = random.sample(valid_features, sample_size)
+
+        return [
+            {
+                "feature_idx": idx,
+                "description": desc,
+            }
+            for idx, desc in sampled
+        ]
 
     @modal.asgi_app()
     def web(self):
@@ -376,6 +918,28 @@ class ModalInterp:
             prompt: str
             steering_configs: list[SteeringItem] = Field(default_factory=list)
             max_new_tokens: int = Field(default=100, ge=0, le=512)
+
+        class AutoInterpretRequest(BaseModel):
+            feature_idx: int
+            example_texts: list[str]
+            n_examples: int = Field(default=5, ge=1, le=20)
+
+        class AutoSteerRequest(BaseModel):
+            prompt: str
+            desired_attributes: list[str]
+            max_new_tokens: int = Field(default=100, ge=0, le=512)
+            top_k_features: int = Field(default=3, ge=1, le=10)
+
+        class AutoSteerFromPromptRequest(BaseModel):
+            prompt: str
+            steering_prompt: str
+            max_new_tokens: int = Field(default=100, ge=0, le=512)
+            top_k_features: int = Field(default=3, ge=1, le=10)
+
+        class PreviewSteeringRequest(BaseModel):
+            prompt: str
+            steering_prompt: str
+            top_k_features: int = Field(default=3, ge=1, le=10)
 
         api = FastAPI()
 
@@ -415,5 +979,44 @@ class ModalInterp:
                 req.prompt, cfgs, max_new_tokens=req.max_new_tokens
             )
             return {"prompt": req.prompt, "full_text": text}
+
+        @api.post("/auto_interpret")
+        def auto_interpret(req: AutoInterpretRequest) -> dict[str, Any]:
+            return self.auto_interpret_feature(
+                req.feature_idx, req.example_texts, req.n_examples
+            )
+
+        @api.post("/auto_steer")
+        def auto_steer_endpoint(req: AutoSteerRequest) -> dict[str, Any]:
+            return self.auto_steer(
+                req.prompt,
+                req.desired_attributes,
+                max_new_tokens=req.max_new_tokens,
+                top_k_features=req.top_k_features,
+            )
+
+        @api.post("/auto_steer_from_prompt")
+        def auto_steer_from_prompt_endpoint(
+            req: AutoSteerFromPromptRequest,
+        ) -> dict[str, Any]:
+            return self.auto_steer_from_prompt(
+                req.prompt,
+                req.steering_prompt,
+                max_new_tokens=req.max_new_tokens,
+                top_k_features=req.top_k_features,
+            )
+
+        @api.post("/preview_steering")
+        def preview_steering_endpoint(req: PreviewSteeringRequest) -> dict[str, Any]:
+            return self.preview_steering(
+                req.prompt,
+                req.steering_prompt,
+                top_k_features=req.top_k_features,
+            )
+
+        @api.get("/random_features")
+        def random_features_endpoint(count: int = 25) -> dict[str, Any]:
+            features = self.get_random_features(count=count)
+            return {"features": features}
 
         return api

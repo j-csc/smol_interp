@@ -217,7 +217,6 @@ function MixerChannel({
           step="0.1"
           value={value}
           onChange={(e) => setValue(parseFloat(e.target.value))}
-          orient="vertical"
           className="absolute inset-0 h-full w-full cursor-ns-resize opacity-0"
         />
       </div>
